@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
 } from 'recharts';
+import { Analytics } from '@vercel/analytics/react';
 
 /* ============================================================================
    80-IN-8  ·  Optiver-format mental-arithmetic simulator
@@ -567,6 +568,7 @@ function Results({ r, onRetake, onHome }) {
         <button className="btn" onClick={onRetake} style={{ background: T.cyan, color: '#04231f', fontFamily: MONO, fontWeight: 700, fontSize: 15, padding: '13px 24px' }}>Retake →</button>
         <button className="btn" onClick={onHome} style={{ background: T.panel, border: `1px solid ${T.line}`, color: T.ink, fontFamily: MONO, fontSize: 15, padding: '13px 24px' }}>Dashboard</button>
       </div>
+      <Analytics />
     </div>
   );
 }
