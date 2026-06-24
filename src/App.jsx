@@ -2,30 +2,25 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine,
 } from 'recharts';
+import { supabase } from './supabaseClient';
 
 /* ============================================================================
    80-IN-8  ·  Optiver-format mental-arithmetic simulator
    Format, scoring and tiers per the supplied 2025–26 briefing.
-   - 80 multiple-choice questions, 8:00 total, ~6.0s each
-   - Sequential: no skipping, no going back (like the real test)
-   - Scoring: +1 correct, -1 wrong, 0 for questions not reached
-     (dominant reported rule; -2/wrong is disputed in sources)
-   - "Where you stand" = community-reported tiers, NOT an official percentile
    ========================================================================== */
 
 const TOTAL = 80;
 const DURATION = 480; // seconds
 
 const T = {
-  bg: '#0b0f14', panel: '#121821', panel2: '#0e141c', line: '#1f2832',
-  ink: '#e8eef4', muted: '#7d8b9c', faint: '#4a5765',
-  amber: '#f0a92b',   // live clock / pass tier
-  cyan: '#36c0c8',    // action / correct / competitive
-  red: '#ef5350',     // wrong / low time / below cutoff
-  green: '#4ec98f',   // top tier
+  bg: '#08090d', bg2: '#0b0d12', surface: '#101218', surface2: '#0c0e14',
+  border: '#1b1e27', borderSoft: '#16181f',
+  ink: '#f0f2f6', sub: '#9aa3b2', faint: '#586070',
+  amber: '#f4b942', green: '#46d399', cyan: '#4fd0d6', red: '#f06560',
 };
-const MONO = "'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, Consolas, monospace";
-const SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const DISPLAY = "'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+const SANS = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+const MONO = "'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
 
 /* ----------------------------- exact-decimal engine ----------------------- */
 // A number is {m, s} meaning m * 10^-s. All display is exact (no float cruft).
@@ -116,37 +111,44 @@ function bandFor(score) {
 }
 
 const accColor = (p) => (p < 55 ? T.red : p < 70 ? T.amber : p < 85 ? T.cyan : T.green);
+const speedColor = (s) => (s < 6 ? T.green : s < 8 ? T.cyan : s < 12 ? T.amber : T.red);
+const reachedColor = (r) => (r >= 65 ? T.cyan : r >= 50 ? T.amber : T.red);
 const fmtClock = (sec) => `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+const fmtDate = (ts) => {
+  const d = new Date(ts);
+  const m = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${d.getDate()} ${m[d.getMonth()]}, ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
 
-/* ----------------------------- persistence (localStorage) ----------------- */
+/* ----------------------------- persistence -------------------------------- */
+// Local (guest) storage key. When signed in, sessions live in Supabase instead.
 const KEY = 'optiver_80in8_sessions_v1';
-async function loadSessions() {
-  try { const raw = localStorage.getItem(KEY); return { ok: true, data: raw ? JSON.parse(raw) : [] }; }
-  catch (e) { return { ok: false, data: [] }; }
-}
-async function saveSessions(arr) {
-  try { localStorage.setItem(KEY, JSON.stringify(arr.slice(-200))); return true; }
-  catch (e) { return false; }
-}
 
-/* ----------------------------- small UI atoms ----------------------------- */
-const Eyebrow = ({ children, color = T.muted }) => (
-  <div style={{ fontFamily: MONO, fontSize: 11, letterSpacing: '0.18em', textTransform: 'uppercase', color }}>{children}</div>
+/* ----------------------------- atoms -------------------------------------- */
+const Eyebrow = ({ children, color = T.faint }) => (
+  <div style={{ fontFamily: SANS, fontSize: 11, fontWeight: 600, letterSpacing: '0.14em', textTransform: 'uppercase', color }}>{children}</div>
 );
 const Panel = ({ children, style }) => (
-  <div style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 12, ...style }}>{children}</div>
+  <div className="card" style={style}>{children}</div>
+);
+const Wordmark = ({ size = 18 }) => (
+  <span style={{ fontFamily: DISPLAY, fontWeight: 700, fontSize: size, letterSpacing: '-0.01em', color: T.ink }}>
+    80<span style={{ color: T.amber }}>·</span>IN<span style={{ color: T.amber }}>·</span>8
+  </span>
 );
 
 /* ============================================================================
    App
    ========================================================================== */
 export default function App() {
-  const [phase, setPhase] = useState('home'); // home | test | results
+  const [phase, setPhase] = useState('home');
   const [sessions, setSessions] = useState([]);
   const [storageOK, setStorageOK] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [user, setUser] = useState(null);
+  const [showAuth, setShowAuth] = useState(false);
 
   const [questions, setQuestions] = useState([]);
   const [idx, setIdx] = useState(0);
@@ -156,27 +158,92 @@ export default function App() {
   const answersRef = useRef([]);
   const startRef = useRef(0);
   const endRef = useRef(0);
+  const qStartRef = useRef(0);
   const finishedRef = useRef(false);
   const finishRef = useRef(() => {});
+  const userRef = useRef(null);
+  const handledUserRef = useRef(null);
+  useEffect(() => { userRef.current = user; }, [user]);
 
-  useEffect(() => { (async () => { const { ok, data } = await loadSessions(); setSessions(data); setStorageOK(ok); setLoaded(true); })(); }, []);
+  // Pull a user's sessions from Supabase, merging in any local guest runs once.
+  const handleAuthUser = useCallback(async (u) => {
+    if (handledUserRef.current === u.id) { setUser(u); return; }
+    handledUserRef.current = u.id;
+    setUser(u);
+    try {
+      const { data, error } = await supabase.from('sessions').select('ts,data').eq('user_id', u.id).order('ts');
+      const cloud = (!error && data) ? data.map((r) => r.data) : [];
+      let local = [];
+      try { const raw = localStorage.getItem(KEY); local = raw ? JSON.parse(raw) : []; } catch (e) { /* ignore */ }
+      const cloudTs = new Set(cloud.map((s) => s.ts));
+      const toUpload = local.filter((s) => !cloudTs.has(s.ts));
+      if (toUpload.length) {
+        await supabase.from('sessions').insert(toUpload.map((s) => ({ user_id: u.id, ts: s.ts, data: s })));
+      }
+      setSessions([...cloud, ...toUpload].sort((a, b) => a.ts - b.ts));
+      setStorageOK(true);
+    } catch (e) { setStorageOK(false); }
+    setLoaded(true);
+  }, []);
+
+  // load fonts + saved sessions (auth-aware)
+  useEffect(() => {
+    const id = 'gf-80in8';
+    if (!document.getElementById(id)) {
+      const l = document.createElement('link'); l.id = id; l.rel = 'stylesheet';
+      l.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600;700&display=swap';
+      document.head.appendChild(l);
+    }
+
+    const loadLocalInit = () => {
+      try { const raw = localStorage.getItem(KEY); setSessions(raw ? JSON.parse(raw) : []); setStorageOK(true); }
+      catch (e) { setSessions([]); setStorageOK(false); }
+      setLoaded(true);
+    };
+
+    if (!supabase) { loadLocalInit(); return undefined; }
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session && data.session.user) handleAuthUser(data.session.user);
+      else loadLocalInit();
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+      if (session && session.user) handleAuthUser(session.user);
+      else { handledUserRef.current = null; setUser(null); loadLocalInit(); }
+    });
+    return () => { sub.subscription.unsubscribe(); };
+  }, [handleAuthUser]);
 
   const finishTest = useCallback(() => {
     if (finishedRef.current) return; finishedRef.current = true;
     const ans = answersRef.current;
-    let correct = 0, reached = 0;
-    const byType = {}; ORDER.forEach((t) => (byType[t] = { att: 0, correct: 0 }));
+    let correct = 0, reached = 0, totalAnswerMs = 0;
+    const byType = {}; ORDER.forEach((t) => (byType[t] = { att: 0, correct: 0, ms: 0 }));
     for (let i = 0; i < TOTAL; i++) {
       const a = ans[i]; if (!a) continue; reached++; byType[a.type].att++;
       if (a.correct) { correct++; byType[a.type].correct++; }
+      const ms = a.ms || 0; byType[a.type].ms += ms; totalAnswerMs += ms;
     }
     const wrong = reached - correct;
     const unreached = TOTAL - reached;
     const score = correct - wrong;
     const timeUsed = Math.min(DURATION, Math.round((Date.now() - startRef.current) / 1000));
-    const session = { ts: Date.now(), score, correct, wrong, unreached, reached, timeUsed, byType };
-    setSessions((prev) => { const next = [...prev, session]; saveSessions(next); return next; });
-    setResult({ ...session, band: bandFor(score), accuracy: reached ? Math.round((correct / reached) * 100) : 0 });
+    const session = { ts: Date.now(), score, correct, wrong, unreached, reached, timeUsed, byType, totalAnswerMs };
+    setSessions((prev) => {
+      const next = [...prev, session];
+      const u = userRef.current;
+      if (supabase && u) {
+        supabase.from('sessions').insert({ user_id: u.id, ts: session.ts, data: session }).then(() => {}, () => {});
+      } else {
+        try { localStorage.setItem(KEY, JSON.stringify(next.slice(-200))); } catch (e) { /* ignore */ }
+      }
+      return next;
+    });
+    setResult({
+      ...session, band: bandFor(score),
+      accuracy: reached ? Math.round((correct / reached) * 100) : 0,
+      avgSpeed: reached ? totalAnswerMs / reached / 1000 : null,
+    });
     setPhase('results');
   }, []);
   finishRef.current = finishTest;
@@ -193,26 +260,32 @@ export default function App() {
 
   const startTest = () => {
     setQuestions(buildTest());
-    answersRef.current = [];
-    finishedRef.current = false;
-    setIdx(0);
-    setRemaining(DURATION);
-    startRef.current = Date.now();
-    endRef.current = Date.now() + DURATION * 1000;
-    setResult(null);
-    setPhase('test');
+    answersRef.current = []; finishedRef.current = false;
+    setIdx(0); setRemaining(DURATION);
+    startRef.current = Date.now(); endRef.current = Date.now() + DURATION * 1000; qStartRef.current = Date.now();
+    setResult(null); window.scrollTo(0, 0); setPhase('test');
   };
 
   const answer = (optIdx) => {
     if (finishedRef.current) return;
+    const now = Date.now();
     const q = questions[idx];
-    answersRef.current[idx] = { type: q.type, correct: q.options[optIdx].correct };
+    answersRef.current[idx] = { type: q.type, correct: q.options[optIdx].correct, ms: now - qStartRef.current };
+    qStartRef.current = now;
     if (idx + 1 >= TOTAL) finishTest(); else setIdx(idx + 1);
   };
 
-  const doReset = () => { setConfirmReset(false); setSessions([]); saveSessions([]); };
+  const doReset = () => {
+    setConfirmReset(false); setSessions([]);
+    const u = userRef.current;
+    if (supabase && u) { supabase.from('sessions').delete().eq('user_id', u.id).then(() => {}, () => {}); }
+    else { try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ } }
+  };
+  const goHome = () => { window.scrollTo(0, 0); setPhase('home'); };
+  const signInGoogle = () => { if (supabase) supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: window.location.origin } }); };
+  const signInEmail = (email) => (supabase ? supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } }) : Promise.resolve({ error: true }));
+  const signOut = async () => { if (supabase) await supabase.auth.signOut(); window.scrollTo(0, 0); setPhase('home'); };
 
-  /* derived dashboard stats */
   const stats = useMemo(() => {
     const n = sessions.length;
     if (!n) return null;
@@ -222,202 +295,455 @@ export default function App() {
     const last5 = scores.slice(-5);
     const avg5 = last5.reduce((a, b) => a + b, 0) / last5.length;
     const totalQ = sessions.reduce((a, s) => a + s.reached, 0);
-    const agg = {}; ORDER.forEach((t) => (agg[t] = { att: 0, correct: 0 }));
-    sessions.forEach((s) => ORDER.forEach((t) => { if (s.byType && s.byType[t]) { agg[t].att += s.byType[t].att; agg[t].correct += s.byType[t].correct; } }));
-    const trend = sessions.map((s, i) => ({ n: i + 1, score: s.score }));
+
+    const accs = []; const reaches = [];
+    sessions.forEach((s) => { if (s.reached > 0) accs.push(s.correct / s.reached); reaches.push(s.reached); });
+    const avgAcc = accs.length ? accs.reduce((a, b) => a + b, 0) / accs.length : 0;
+    const avgReached = reaches.reduce((a, b) => a + b, 0) / reaches.length;
+
+    const agg = {}; ORDER.forEach((t) => (agg[t] = { att: 0, correct: 0, ms: 0, msN: 0 }));
+    let totMs = 0; let totMsN = 0;
+    sessions.forEach((s) => ORDER.forEach((t) => {
+      const b = s.byType && s.byType[t]; if (!b) return;
+      agg[t].att += b.att; agg[t].correct += b.correct;
+      if (typeof b.ms === 'number' && b.att > 0) { agg[t].ms += b.ms; agg[t].msN += b.att; totMs += b.ms; totMsN += b.att; }
+    }));
+    const avgSpeed = totMsN ? totMs / totMsN / 1000 : null;
+
+    const trend = scores.map((sc, i) => {
+      const w = scores.slice(Math.max(0, i - 2), i + 1);
+      const ma = w.reduce((a, b) => a + b, 0) / w.length;
+      return { n: i + 1, score: sc, ma: Math.round(ma * 10) / 10 };
+    });
     const yMin = Math.min(0, ...scores);
-    return { n, last, best, avg5, totalQ, agg, trend, yMin };
+    return { n, last, best, avg5, totalQ, avgAcc, avgReached, agg, avgSpeed, trend, yMin };
   }, [sessions]);
 
   return (
-    <div className="o8" style={{ background: T.bg, color: T.ink, fontFamily: SANS, minHeight: '100vh', padding: '24px 16px 56px' }}>
-      <style>{`
-        .o8 *{box-sizing:border-box}
-        .o8 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
-        .o8 .opt{background:${T.panel};border:1px solid ${T.line};border-radius:12px;padding:22px 16px;font-family:${MONO};color:${T.ink};transition:border-color .12s,background .12s,transform .04s;text-align:center}
-        .o8 .opt:hover:not(:disabled){border-color:${T.cyan};background:#16202b}
-        .o8 .opt:active{transform:translateY(1px)}
-        .o8 .opt:focus-visible{outline:2px solid ${T.cyan};outline-offset:2px}
-        .o8 .btn{border-radius:10px;font-weight:600;transition:filter .12s,transform .04s}
-        .o8 .btn:hover{filter:brightness(1.08)}
-        .o8 .btn:active{transform:translateY(1px)}
-        .o8 .btn:focus-visible{outline:2px solid ${T.cyan};outline-offset:2px}
-        .o8 .hero{display:grid;grid-template-columns:1fr;gap:18px}
-        .o8 .opts{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
-        .o8 .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-        @media(min-width:700px){.o8 .hero{grid-template-columns:1.25fr 1fr;align-items:stretch}}
-        @media(max-width:560px){.o8 .opts{grid-template-columns:1fr}.o8 .tiles{grid-template-columns:repeat(2,1fr)}}
-        .o8 .pulse{animation:o8pulse 1s ease-in-out infinite}
-        @keyframes o8pulse{0%,100%{opacity:1}50%{opacity:.5}}
-        @media(prefers-reduced-motion:reduce){.o8 *{animation:none!important;transition:none!important}}
-      `}</style>
+    <div className="o8" style={{ background: T.bg, color: T.ink, fontFamily: SANS, minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      <style>{styles}</style>
 
-      <div style={{ maxWidth: 880, margin: '0 auto' }}>
-        {phase === 'home' && (
-          <Home
-            stats={stats} loaded={loaded} storageOK={storageOK}
-            onStart={startTest} showInfo={showInfo} setShowInfo={setShowInfo}
-            confirmReset={confirmReset} setConfirmReset={setConfirmReset} doReset={doReset}
-          />
+      {(phase === 'home' || phase === 'results') && (
+        <nav className="nav">
+          <button onClick={goHome} style={{ display: 'flex', alignItems: 'center' }}><Wordmark /></button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {phase === 'home' && <button className="ghost" onClick={() => setShowInfo((v) => !v)} style={{ fontSize: 14 }}>How it works</button>}
+            {supabase && (user
+              ? <UserChip user={user} onSignOut={signOut} />
+              : <button className="ghost" onClick={() => setShowAuth(true)} style={{ fontSize: 14 }}>Sign in</button>)}
+            <button className="pill btn" onClick={startTest} style={{ fontSize: 14 }}>Start test</button>
+          </div>
+        </nav>
+      )}
+
+      {showAuth && <AuthModal onClose={() => setShowAuth(false)} onGoogle={signInGoogle} onEmail={signInEmail} />}
+
+      <div style={{ flex: 1, padding: '0 18px' }}>
+        <div style={{ maxWidth: 1080, margin: '0 auto' }}>
+          {phase === 'home' && (
+            <Home
+              stats={stats} sessions={sessions} loaded={loaded} storageOK={storageOK}
+              onStart={startTest} showInfo={showInfo} setShowInfo={setShowInfo}
+              confirmReset={confirmReset} setConfirmReset={setConfirmReset} doReset={doReset}
+            />
+          )}
+          {phase === 'test' && <div style={{ padding: '26px 0 56px' }}><TestView q={questions[idx]} idx={idx} remaining={remaining} onAnswer={answer} /></div>}
+          {phase === 'results' && <div style={{ padding: '30px 0 56px' }}><Results r={result} onRetake={startTest} onHome={goHome} /></div>}
+        </div>
+      </div>
+
+      {phase === 'home' && <Footer />}
+    </div>
+  );
+}
+
+/* ----------------------------- chrome ------------------------------------- */
+function Footer() {
+  return (
+    <footer style={{ borderTop: `1px solid ${T.border}`, marginTop: 32 }}>
+      <div style={{ maxWidth: 1080, margin: '0 auto', padding: '28px 18px 44px', display: 'flex', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
+        <div style={{ maxWidth: '46ch' }}>
+          <Wordmark size={16} />
+          <p style={{ color: T.sub, fontSize: 13, lineHeight: 1.6, margin: '10px 0 0' }}>
+            A faithful rehearsal of the Optiver-format mental-arithmetic screen. Your scores and analysis stay in your browser.
+          </p>
+        </div>
+        <p style={{ color: T.faint, fontSize: 12, lineHeight: 1.6, margin: 0, maxWidth: '38ch' }}>
+          Not affiliated with Optiver. Score tiers are community-reported, not official, and not a percentile.
+        </p>
+      </div>
+    </footer>
+  );
+}
+
+const GoogleMark = () => (
+  <svg width="17" height="17" viewBox="0 0 48 48" aria-hidden="true">
+    <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.9 2.4 30.3 0 24 0 14.6 0 6.5 5.4 2.5 13.2l7.9 6.1C12.2 13.1 17.6 9.5 24 9.5z" />
+    <path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v9h12.7c-.5 3-2.2 5.5-4.7 7.2l7.3 5.7C43.9 38 46.5 31.8 46.5 24.5z" />
+    <path fill="#FBBC05" d="M10.4 28.3c-.5-1.5-.8-3.1-.8-4.8s.3-3.3.8-4.8l-7.9-6.1C.9 16 0 19.9 0 24s.9 8 2.5 11.4l7.9-7.1z" />
+    <path fill="#34A853" d="M24 48c6.3 0 11.6-2.1 15.5-5.7l-7.3-5.7c-2 1.4-4.7 2.3-8.2 2.3-6.4 0-11.8-3.6-13.6-8.8l-7.9 7.1C6.5 42.6 14.6 48 24 48z" />
+  </svg>
+);
+
+function UserChip({ user, onSignOut }) {
+  const meta = user.user_metadata || {};
+  const name = meta.full_name || meta.name || user.email || 'Account';
+  const avatar = meta.avatar_url || meta.picture;
+  const initial = (name || 'U').trim().charAt(0).toUpperCase();
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      {avatar
+        ? <img src={avatar} alt="" width={26} height={26} referrerPolicy="no-referrer" style={{ borderRadius: 999, border: `1px solid ${T.border}` }} />
+        : <div style={{ width: 26, height: 26, borderRadius: 999, background: T.surface, border: `1px solid ${T.border}`, display: 'grid', placeItems: 'center', fontFamily: MONO, fontSize: 12, color: T.sub }}>{initial}</div>}
+      <span style={{ fontSize: 13, color: T.sub, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+      <button className="ghost" onClick={onSignOut} style={{ fontSize: 12.5 }}>Sign out</button>
+    </div>
+  );
+}
+
+function AuthModal({ onClose, onGoogle, onEmail }) {
+  const [email, setEmail] = useState('');
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const submitEmail = async () => {
+    if (!email || busy) return;
+    setBusy(true); setErr('');
+    try { const r = await onEmail(email); if (r && r.error) throw r.error; setSent(true); }
+    catch (e) { setErr('Could not send the link. Check the address and try again.'); }
+    setBusy(false);
+  };
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, zIndex: 60, background: 'rgba(4,5,8,.66)', backdropFilter: 'blur(4px)', WebkitBackdropFilter: 'blur(4px)', display: 'grid', placeItems: 'center', padding: 18 }}>
+      <div onClick={(e) => e.stopPropagation()} className="card fadein" style={{ width: '100%', maxWidth: 380, padding: '26px 24px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Wordmark size={16} />
+          <button className="ghost" onClick={onClose} aria-label="Close" style={{ fontSize: 18, lineHeight: 1, padding: '4px 9px' }}>×</button>
+        </div>
+        <h3 style={{ fontFamily: DISPLAY, fontWeight: 600, fontSize: 22, margin: '16px 0 4px', letterSpacing: '-0.01em' }}>Save your progress</h3>
+        <p style={{ color: T.sub, fontSize: 13.5, lineHeight: 1.55, margin: '0 0 20px' }}>Sign in so your scores and analysis follow you across devices. Your existing local runs come with you.</p>
+
+        <button className="btn" onClick={onGoogle} style={{ width: '100%', background: T.ink, color: '#0a0b0f', fontWeight: 600, fontFamily: SANS, fontSize: 15, padding: '12px', borderRadius: 11, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+          <GoogleMark /> Continue with Google
+        </button>
+
+        {!sent ? (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '18px 0' }}>
+              <div style={{ flex: 1, height: 1, background: T.border }} /><span style={{ fontSize: 11, color: T.faint }}>or</span><div style={{ flex: 1, height: 1, background: T.border }} />
+            </div>
+            <input
+              value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && submitEmail()}
+              placeholder="you@email.com" type="email" autoComplete="email"
+              style={{ width: '100%', background: T.surface2, border: `1px solid ${T.border}`, borderRadius: 11, padding: '12px 14px', color: T.ink, fontFamily: SANS, fontSize: 14.5 }}
+            />
+            <button className="btn" onClick={submitEmail} disabled={busy} style={{ width: '100%', marginTop: 10, background: T.surface, border: `1px solid ${T.border}`, color: T.ink, fontWeight: 600, fontFamily: SANS, fontSize: 14.5, padding: '12px', borderRadius: 11, opacity: busy ? 0.6 : 1 }}>
+              {busy ? 'Sending…' : 'Email me a sign-in link'}
+            </button>
+            {err && <p style={{ color: T.red, fontSize: 12.5, margin: '10px 0 0' }}>{err}</p>}
+          </>
+        ) : (
+          <p style={{ color: T.green, fontSize: 13.5, lineHeight: 1.55, margin: '18px 0 0' }}>
+            Check your inbox — a sign-in link is on its way to <b style={{ color: T.ink }}>{email}</b>. Open it on this device.
+          </p>
         )}
-        {phase === 'test' && (
-          <TestView q={questions[idx]} idx={idx} remaining={remaining} onAnswer={answer} />
-        )}
-        {phase === 'results' && result && (
-          <Results r={result} onRetake={startTest} onHome={() => setPhase('home')} />
-        )}
+
+        <p style={{ color: T.faint, fontSize: 11, lineHeight: 1.5, margin: '20px 0 0' }}>You can keep using it without an account — local runs just won&apos;t sync.</p>
       </div>
     </div>
   );
 }
 
 /* ----------------------------- Home --------------------------------------- */
-function Home({ stats, loaded, storageOK, onStart, showInfo, setShowInfo, confirmReset, setConfirmReset, doReset }) {
+function Home({ stats, sessions, loaded, storageOK, onStart, showInfo, setShowInfo, confirmReset, setConfirmReset, doReset }) {
   return (
-    <>
-      <header style={{ marginBottom: 22 }}>
-        <Eyebrow color={T.amber}>Optiver-format · mental-arithmetic screen</Eyebrow>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, flexWrap: 'wrap', marginTop: 6 }}>
-          <h1 style={{ fontFamily: MONO, fontWeight: 700, fontSize: 'clamp(2.4rem,8vw,3.6rem)', letterSpacing: '-0.02em', margin: 0, lineHeight: 1 }}>80-IN-8</h1>
-          <span style={{ color: T.muted, fontSize: 14 }}>the arithmetic gate, simulated exactly</span>
-        </div>
-      </header>
-
-      {/* hero / signature */}
-      <div className="hero" style={{ marginBottom: 22 }}>
-        <Panel style={{ padding: '22px 22px 24px' }}>
-          <p style={{ color: T.ink, fontSize: 15, lineHeight: 1.55, margin: '0 0 8px' }}>
-            80 questions. 8 minutes. No calculator. Multiple choice with negative marking. Sequential — you can&apos;t skip or go back.
-          </p>
-          <p style={{ color: T.muted, fontSize: 13.5, lineHeight: 1.55, margin: '0 0 20px' }}>
-            Decimal- and fraction-heavy, like the real screen. The distractors are built around decimal-place slips — the error that actually fails people.
-          </p>
-          <button className="btn" onClick={onStart}
-            style={{ background: T.cyan, color: '#04231f', fontFamily: MONO, fontSize: 16, fontWeight: 700, padding: '14px 26px', letterSpacing: '0.02em' }}>
-            Start the test →
-          </button>
-          <button className="btn" onClick={() => setShowInfo((v) => !v)}
-            style={{ marginLeft: 10, color: T.muted, fontSize: 13, padding: '14px 8px', fontFamily: MONO }}>
-            {showInfo ? 'hide scoring' : 'how scoring works'}
-          </button>
-        </Panel>
-
-        {/* terminal-style clock lockup = the signature */}
-        <Panel style={{ background: T.panel2, padding: '20px 22px', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-          <Eyebrow>the clock</Eyebrow>
-          <div style={{ fontFamily: MONO, fontSize: 'clamp(3rem,12vw,4.6rem)', fontWeight: 700, color: T.amber, lineHeight: 1, letterSpacing: '0.02em', margin: '8px 0 2px' }}>8:00</div>
-          <div style={{ display: 'flex', gap: 18, marginTop: 10, fontFamily: MONO, fontSize: 13, color: T.muted }}>
-            <span><span style={{ color: T.ink }}>80</span> questions</span>
-            <span><span style={{ color: T.ink }}>~6.0s</span> each</span>
+    <div>
+      {/* hero */}
+      <section style={{ padding: 'clamp(40px,8vh,84px) 0 clamp(28px,5vh,52px)' }}>
+        <div className="hero-grid">
+          <div className="fadein">
+            <Eyebrow color={T.amber}>Optiver-format · mental-arithmetic screen</Eyebrow>
+            <h1 style={{ fontFamily: DISPLAY, fontWeight: 700, fontSize: 'clamp(2.6rem,6vw,4.2rem)', lineHeight: 1.02, letterSpacing: '-0.03em', margin: '16px 0 0', color: T.ink }}>
+              Beat the<br />eight-minute clock.
+            </h1>
+            <p style={{ color: T.sub, fontSize: 'clamp(15px,1.5vw,17px)', lineHeight: 1.6, maxWidth: '46ch', margin: '20px 0 0' }}>
+              80 mental-arithmetic questions, negatively marked, at roughly six seconds each — the screen prop firms use to filter quant applicants. Rehearse it until the timer stops mattering.
+            </p>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 30 }}>
+              <button className="pill btn" onClick={onStart} style={{ fontSize: 16, padding: '14px 26px' }}>Start the test →</button>
+              <button className="ghost" onClick={() => setShowInfo((v) => !v)} style={{ fontSize: 15, padding: '14px 16px' }}>How scoring works</button>
+            </div>
           </div>
-        </Panel>
-      </div>
 
-      {showInfo && <InfoPanel />}
+          <div className="fadein" style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
+            <div style={{ position: 'absolute', inset: '-24% -8%', background: 'radial-gradient(closest-side, rgba(244,185,66,.16), transparent)', pointerEvents: 'none' }} />
+            <Panel style={{ position: 'relative', padding: '30px 38px', textAlign: 'center', minWidth: 248 }}>
+              <Eyebrow color={T.faint}>the eight-minute clock</Eyebrow>
+              <div style={{ fontFamily: MONO, fontWeight: 700, fontSize: 'clamp(3.4rem,11vw,5rem)', color: T.amber, lineHeight: 1, letterSpacing: '0.01em', margin: '14px 0 12px' }}>8:00</div>
+              <div style={{ display: 'flex', justifyContent: 'center', gap: 16, fontFamily: MONO, fontSize: 12.5, color: T.sub }}>
+                <span><b style={{ color: T.ink }}>80</b> questions</span>
+                <span><b style={{ color: T.ink }}>~6.0s</b> each</span>
+              </div>
+              <div style={{ marginTop: 10, fontSize: 12, color: T.faint }}>no calculator · negative marking</div>
+            </Panel>
+          </div>
+        </div>
+      </section>
 
-      {/* dashboard */}
+      {showInfo && <div style={{ marginBottom: 8 }}><InfoPanel /></div>}
+
       {loaded && stats && (
-        <>
-          <div className="tiles" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16, borderTop: `1px solid ${T.border}`, paddingTop: 30 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+            <h2 style={{ fontFamily: DISPLAY, fontWeight: 600, fontSize: 'clamp(1.4rem,3vw,1.8rem)', letterSpacing: '-0.01em', margin: 0 }}>Your progress</h2>
+            <span style={{ fontFamily: MONO, fontSize: 12.5, color: T.faint }}>{stats.n} session{stats.n > 1 ? 's' : ''} logged</span>
+          </div>
+
+          <ReadinessMeter avg={stats.avg5} />
+
+          <div className="tiles">
             <Tile label="Sessions" value={stats.n} />
             <Tile label="Best score" value={stats.best} color={bandFor(stats.best).color} />
-            <Tile label="Last score" value={stats.last} color={bandFor(stats.last).color} />
-            <Tile label="Avg (last 5)" value={stats.avg5.toFixed(1)} />
+            <Tile label="Avg score" value={stats.avg5.toFixed(1)} sub="last 5" color={bandFor(stats.avg5).color} />
+            <Tile label="Avg accuracy" value={`${Math.round(stats.avgAcc * 100)}%`} sub="correct / reached" color={accColor(stats.avgAcc * 100)} />
+            <Tile label="Avg reached" value={Math.round(stats.avgReached)} sub="of 80" color={reachedColor(stats.avgReached)} />
+            <Tile label="Total Qs" value={stats.totalQ} sub="answered" />
           </div>
 
-          <Panel style={{ padding: '18px 18px 10px', marginBottom: 16 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+          <Panel style={{ padding: '20px 20px 14px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
               <Eyebrow>Score trend</Eyebrow>
               <span style={{ fontFamily: MONO, fontSize: 11, color: T.faint }}>
-                <span style={{ color: T.amber }}>--</span> 55 cutoff &nbsp; <span style={{ color: T.green }}>--</span> 70 competitive
+                <span style={{ color: T.cyan }}>—</span> score &nbsp; <span style={{ color: T.sub }}>– –</span> 3-run avg &nbsp; <span style={{ color: T.amber }}>– –</span> 55 &nbsp; <span style={{ color: T.green }}>– –</span> 70
               </span>
             </div>
-            <div style={{ width: '100%', height: 230 }}>
+            <div style={{ width: '100%', height: 252 }}>
               <ResponsiveContainer>
-                <LineChart data={stats.trend} margin={{ top: 8, right: 14, left: -18, bottom: 0 }}>
-                  <CartesianGrid stroke={T.line} strokeDasharray="2 4" vertical={false} />
-                  <XAxis dataKey="n" stroke={T.muted} tick={{ fontSize: 11, fill: T.muted }} tickLine={false} axisLine={{ stroke: T.line }} />
-                  <YAxis domain={[stats.yMin, 80]} stroke={T.muted} tick={{ fontSize: 11, fill: T.muted }} tickLine={false} axisLine={{ stroke: T.line }} width={34} />
+                <LineChart data={stats.trend} margin={{ top: 8, right: 16, left: 6, bottom: 0 }}>
+                  <CartesianGrid stroke={T.border} strokeDasharray="2 5" vertical={false} />
+                  <XAxis dataKey="n" stroke={T.faint} tick={{ fontSize: 11, fill: T.faint, fontFamily: MONO }} tickLine={false} axisLine={{ stroke: T.border }} />
+                  <YAxis domain={[stats.yMin, 80]} allowDecimals={false} stroke={T.faint} tick={{ fontSize: 11, fill: T.faint, fontFamily: MONO }} tickLine={false} axisLine={{ stroke: T.border }} width={40} />
                   <Tooltip
-                    contentStyle={{ background: T.bg, border: `1px solid ${T.line}`, borderRadius: 8, fontFamily: MONO, fontSize: 12 }}
-                    labelStyle={{ color: T.muted }} itemStyle={{ color: T.cyan }}
-                    labelFormatter={(l) => `Test #${l}`} formatter={(v) => [v, 'score']} />
-                  <ReferenceLine y={55} stroke={T.amber} strokeDasharray="4 4" strokeOpacity={0.55} />
-                  <ReferenceLine y={70} stroke={T.green} strokeDasharray="4 4" strokeOpacity={0.55} />
-                  <Line type="monotone" dataKey="score" stroke={T.cyan} strokeWidth={2} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5 }} />
+                    contentStyle={{ background: T.bg2, border: `1px solid ${T.border}`, borderRadius: 10, fontFamily: MONO, fontSize: 12 }}
+                    labelStyle={{ color: T.sub }} itemStyle={{ color: T.cyan }}
+                    labelFormatter={(l) => `Run #${l}`} />
+                  <ReferenceLine y={55} stroke={T.amber} strokeDasharray="4 4" strokeOpacity={0.5} />
+                  <ReferenceLine y={70} stroke={T.green} strokeDasharray="4 4" strokeOpacity={0.5} />
+                  <Line type="monotone" dataKey="ma" name="3-run avg" stroke={T.sub} strokeWidth={1.5} strokeDasharray="5 3" dot={false} />
+                  <Line type="monotone" dataKey="score" name="score" stroke={T.cyan} strokeWidth={2.25} dot={{ r: 3, fill: T.cyan, strokeWidth: 0 }} activeDot={{ r: 5 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
           </Panel>
 
-          <Panel style={{ padding: 18, marginBottom: 16 }}>
-            <Eyebrow>Lifetime accuracy by type · your drill order</Eyebrow>
-            <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {ORDER.map((t) => {
-                const a = stats.agg[t]; const pct = a.att ? Math.round((a.correct / a.att) * 100) : null;
-                return (
-                  <div key={t} style={{ display: 'grid', gridTemplateColumns: '128px 1fr 76px', alignItems: 'center', gap: 12 }}>
-                    <span style={{ fontSize: 12.5, color: T.muted }}>{LABELS[t]}</span>
-                    <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, height: 12, overflow: 'hidden' }}>
-                      {pct !== null && <div style={{ width: `${pct}%`, height: '100%', background: accColor(pct), transition: 'width .3s' }} />}
-                    </div>
-                    <span style={{ fontFamily: MONO, fontSize: 12, color: pct === null ? T.faint : accColor(pct), textAlign: 'right' }}>
-                      {pct === null ? '—' : `${pct}% · ${a.correct}/${a.att}`}
-                    </span>
-                  </div>
-                );
-              })}
+          <div className="split">
+            <TypePerf agg={stats.agg} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <Diagnostic acc={stats.avgAcc} reached={stats.avgReached} />
+              <PaceCard avgSpeed={stats.avgSpeed} />
+              <WeakestCard agg={stats.agg} />
             </div>
-          </Panel>
+          </div>
+
+          <RecentTable sessions={sessions} />
 
           <div style={{ textAlign: 'right' }}>
             {!confirmReset ? (
-              <button className="btn" onClick={() => setConfirmReset(true)} style={{ color: T.faint, fontSize: 12, fontFamily: MONO, padding: '6px 8px' }}>reset history</button>
+              <button className="ghost" onClick={() => setConfirmReset(true)} style={{ color: T.faint, fontSize: 12, fontFamily: MONO }}>reset history</button>
             ) : (
-              <span style={{ fontSize: 12, fontFamily: MONO, color: T.muted }}>
+              <span style={{ fontSize: 12, fontFamily: MONO, color: T.sub }}>
                 delete all sessions?{' '}
-                <button className="btn" onClick={doReset} style={{ color: T.red, fontFamily: MONO, fontSize: 12, padding: '6px 8px' }}>yes, delete</button>
-                <button className="btn" onClick={() => setConfirmReset(false)} style={{ color: T.muted, fontFamily: MONO, fontSize: 12, padding: '6px 8px' }}>cancel</button>
+                <button className="ghost" onClick={doReset} style={{ color: T.red, fontFamily: MONO, fontSize: 12 }}>yes, delete</button>
+                <button className="ghost" onClick={() => setConfirmReset(false)} style={{ color: T.sub, fontFamily: MONO, fontSize: 12 }}>cancel</button>
               </span>
             )}
           </div>
-        </>
+        </div>
       )}
 
       {loaded && !stats && (
-        <Panel style={{ padding: 22, textAlign: 'center', color: T.muted, fontSize: 14 }}>
-          No sessions yet. Run your first test — your scores and per-type weak spots will track here.
-        </Panel>
+        <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 30 }}>
+          <Panel style={{ padding: '44px 24px', textAlign: 'center' }}>
+            <div style={{ fontFamily: DISPLAY, fontWeight: 600, fontSize: 22, color: T.ink }}>No runs yet</div>
+            <p style={{ color: T.sub, fontSize: 14.5, lineHeight: 1.6, maxWidth: '44ch', margin: '12px auto 0' }}>
+              Take your first test and this fills with your score trend, per-type accuracy and speed, and a read on whether speed or accuracy is what&apos;s holding you back.
+            </p>
+            <button className="pill btn" onClick={onStart} style={{ marginTop: 22, padding: '13px 24px' }}>Start the test →</button>
+          </Panel>
+        </div>
       )}
       {loaded && !storageOK && (
-        <p style={{ color: T.faint, fontFamily: MONO, fontSize: 11.5, marginTop: 14, textAlign: 'center' }}>
-          History isn&apos;t being saved in this view (storage unavailable) — scores will reset when you reload.
+        <p style={{ color: T.faint, fontFamily: MONO, fontSize: 11.5, textAlign: 'center', marginTop: 14 }}>
+          History isn&apos;t being saved in this view (storage unavailable) — scores reset on reload.
         </p>
       )}
-    </>
+    </div>
   );
 }
 
-function Tile({ label, value, color = T.ink }) {
+function Tile({ label, value, sub, color = T.ink }) {
   return (
-    <Panel style={{ padding: '14px 16px' }}>
+    <Panel style={{ padding: '15px 16px' }}>
       <Eyebrow>{label}</Eyebrow>
-      <div style={{ fontFamily: MONO, fontSize: 30, fontWeight: 700, color, marginTop: 6, lineHeight: 1 }}>{value}</div>
+      <div style={{ fontFamily: MONO, fontSize: 29, fontWeight: 700, color, marginTop: 7, lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontFamily: MONO, fontSize: 10.5, color: T.faint, marginTop: 5 }}>{sub}</div>}
+    </Panel>
+  );
+}
+
+function ReadinessMeter({ avg }) {
+  const pos = Math.max(0, Math.min(80, avg)) / 80 * 100;
+  const band = bandFor(avg);
+  let msg;
+  if (avg < 0) msg = <>Negative — you&apos;re losing more than you score. Fix accuracy before anything else.</>;
+  else if (avg < 55) msg = <><b style={{ color: T.amber }}>{Math.ceil(55 - avg)}</b> points to the 55 pass gate.</>;
+  else if (avg < 70) msg = <><b style={{ color: T.cyan }}>{Math.ceil(70 - avg)}</b> points to competitive (70).</>;
+  else if (avg < 77) msg = <><b style={{ color: T.green }}>{Math.ceil(77 - avg)}</b> points to top tier (77).</>;
+  else msg = <>Top tier on recent form. Maintain, then broaden to the rest of the OA.</>;
+  const seg = (w, c) => <div style={{ width: `${w}%`, background: c, height: '100%' }} />;
+  const ticks = [{ v: '0', p: 0 }, { v: '55', p: 68.75 }, { v: '70', p: 87.5 }, { v: '80', p: 100 }];
+  return (
+    <Panel style={{ padding: '20px 22px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 6 }}>
+        <Eyebrow>Readiness · recent form (avg of last 5)</Eyebrow>
+        <span style={{ fontFamily: MONO, fontSize: 13, color: band.color, fontWeight: 500 }}>{band.label}</span>
+      </div>
+      <div style={{ position: 'relative', marginTop: 22 }}>
+        <div style={{ display: 'flex', height: 14, borderRadius: 8, overflow: 'hidden', border: `1px solid ${T.border}` }}>
+          {seg(68.75, 'rgba(240,101,96,.42)')}{seg(18.75, 'rgba(244,185,66,.5)')}{seg(8.75, 'rgba(79,208,214,.5)')}{seg(3.75, 'rgba(70,211,153,.55)')}
+        </div>
+        <div style={{ position: 'absolute', top: -7, left: `${pos}%`, transform: 'translateX(-50%)', transition: 'left .4s', pointerEvents: 'none' }}>
+          <div style={{ width: 2, height: 28, background: T.ink, margin: '0 auto', boxShadow: '0 0 6px rgba(0,0,0,.6)' }} />
+        </div>
+      </div>
+      <div style={{ position: 'relative', height: 14, marginTop: 6 }}>
+        {ticks.map((t) => (
+          <span key={t.v} style={{ position: 'absolute', left: `${t.p}%`, transform: t.p === 0 ? 'none' : t.p === 100 ? 'translateX(-100%)' : 'translateX(-50%)', fontFamily: MONO, fontSize: 10, color: T.faint }}>{t.v}</span>
+        ))}
+      </div>
+      <p style={{ fontSize: 14, color: T.ink, margin: '12px 0 0', lineHeight: 1.5 }}>
+        Recent average <b style={{ fontFamily: MONO, color: band.color }}>{avg.toFixed(1)}</b>. {msg}
+      </p>
+    </Panel>
+  );
+}
+
+function TypePerf({ agg }) {
+  const head = { display: 'grid', gridTemplateColumns: '1fr 52px 58px', gap: '0 12px' };
+  return (
+    <Panel style={{ padding: 20 }}>
+      <Eyebrow>Performance by type · accuracy &amp; speed</Eyebrow>
+      <div style={{ ...head, marginTop: 16, fontFamily: SANS, fontSize: 10, fontWeight: 600, color: T.faint, letterSpacing: '0.1em' }}>
+        <span>TYPE</span><span style={{ textAlign: 'right' }}>ACC</span><span style={{ textAlign: 'right' }}>SPEED</span>
+      </div>
+      <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 13 }}>
+        {ORDER.map((t) => {
+          const a = agg[t]; const pct = a.att ? Math.round((a.correct / a.att) * 100) : null;
+          const sp = a.msN ? a.ms / a.msN / 1000 : null;
+          return (
+            <div key={t}>
+              <div style={{ ...head, alignItems: 'center' }}>
+                <span style={{ fontSize: 13, color: T.sub }}>{LABELS[t]}</span>
+                <span style={{ textAlign: 'right', fontFamily: MONO, fontSize: 12.5, color: pct === null ? T.faint : accColor(pct) }}>{pct === null ? '—' : `${pct}%`}</span>
+                <span style={{ textAlign: 'right', fontFamily: MONO, fontSize: 12.5, color: sp === null ? T.faint : speedColor(sp) }}>{sp === null ? '—' : `${sp.toFixed(1)}s`}</span>
+              </div>
+              <div style={{ background: T.surface2, border: `1px solid ${T.border}`, borderRadius: 6, height: 7, overflow: 'hidden', marginTop: 6 }}>
+                {pct !== null && <div style={{ width: `${pct}%`, height: '100%', background: accColor(pct) }} />}
+              </div>
+              <div style={{ fontFamily: MONO, fontSize: 10, color: T.faint, marginTop: 4 }}>{a.att ? `${a.correct}/${a.att} correct` : 'not attempted'}</div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+function Diagnostic({ acc, reached }) {
+  const a = Math.round(acc * 100); const r = Math.round(reached);
+  const accGood = acc >= 0.85; const reachGood = reached >= 65;
+  let title; let color; let body;
+  if (accGood && reachGood) { title = 'Competitive shape'; color = T.green; body = `Accurate (${a}%) and getting through ${r}/80. The arithmetic gate isn't your limiter anymore — push effort to sequences, probability and the coding OA.`; }
+  else if (accGood && !reachGood) { title = 'Speed is the bottleneck'; color = T.amber; body = `You're accurate (${a}%) but only reaching ${r}/80. You compute fine, you're just not fast enough. Drill raw pace on your slow types — that's where the score is.`; }
+  else if (!accGood && reachGood) { title = 'Accuracy is the bottleneck'; color = T.amber; body = `You reach ${r}/80 but only ${a}% land. Every wrong answer is a −1, so you're bleeding points by rushing. Ease off on the weak types below.`; }
+  else { title = 'Both need work'; color = T.red; body = `Reaching ${r}/80 at ${a}% accuracy. Fix accuracy first — stop the −1 bleed — then push pace once you're reliably past 85%.`; }
+  return (
+    <Panel style={{ padding: '17px 19px', borderLeft: `3px solid ${color}` }}>
+      <Eyebrow color={color}>Diagnosis</Eyebrow>
+      <div style={{ fontFamily: DISPLAY, fontWeight: 600, fontSize: 17, color, margin: '7px 0 7px' }}>{title}</div>
+      <p style={{ fontSize: 13, color: T.ink, lineHeight: 1.55, margin: 0 }}>{body}</p>
+    </Panel>
+  );
+}
+
+function PaceCard({ avgSpeed }) {
+  if (avgSpeed === null) return null;
+  const c = speedColor(avgSpeed);
+  return (
+    <Panel style={{ padding: '17px 19px' }}>
+      <Eyebrow>Pace</Eyebrow>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginTop: 7 }}>
+        <span style={{ fontFamily: MONO, fontSize: 29, fontWeight: 700, color: c }}>{avgSpeed.toFixed(1)}s</span>
+        <span style={{ fontSize: 12.5, color: T.sub }}>per answered question</span>
+      </div>
+      <p style={{ fontSize: 12.5, color: T.sub, margin: '8px 0 0', lineHeight: 1.5 }}>
+        Clearing all 80 needs about <b style={{ fontFamily: MONO, color: T.ink }}>6.0s</b> each. {avgSpeed <= 6.2 ? 'You are on pace for the full set.' : `You are ${(avgSpeed - 6).toFixed(1)}s over — that gap is the rest of the set.`}
+      </p>
+    </Panel>
+  );
+}
+
+function WeakestCard({ agg }) {
+  const weak = ORDER.map((t) => ({ t, ...agg[t] })).filter((x) => x.att >= 3).map((x) => ({ ...x, pct: x.correct / x.att })).sort((a, b) => a.pct - b.pct).slice(0, 2);
+  if (!weak.length) return null;
+  return (
+    <Panel style={{ padding: '17px 19px', borderLeft: `3px solid ${T.amber}` }}>
+      <Eyebrow color={T.amber}>Drill next</Eyebrow>
+      <p style={{ fontSize: 13, color: T.ink, margin: '8px 0 0', lineHeight: 1.5 }}>
+        Weakest types: <b>{weak.map((w) => `${LABELS[w.t]} (${Math.round(w.pct * 100)}%)`).join(', ')}</b>. Target these before your next full run.
+      </p>
+    </Panel>
+  );
+}
+
+function RecentTable({ sessions }) {
+  const rows = [...sessions].slice(-8).reverse();
+  const cols = { display: 'grid', gridTemplateColumns: '1.4fr 58px 56px 70px 60px', gap: '0 10px' };
+  return (
+    <Panel style={{ padding: 20 }}>
+      <Eyebrow>Recent sessions</Eyebrow>
+      <div style={{ marginTop: 16, overflowX: 'auto' }}>
+        <div style={{ ...cols, fontFamily: SANS, fontSize: 10, fontWeight: 600, color: T.faint, letterSpacing: '0.1em', paddingBottom: 9, borderBottom: `1px solid ${T.border}` }}>
+          <span>WHEN</span><span style={{ textAlign: 'right' }}>SCORE</span><span style={{ textAlign: 'right' }}>ACC</span><span style={{ textAlign: 'right' }}>REACHED</span><span style={{ textAlign: 'right' }}>TIME</span>
+        </div>
+        {rows.map((s, i) => {
+          const acc = s.reached ? Math.round((s.correct / s.reached) * 100) : 0;
+          return (
+            <div key={i} style={{ ...cols, alignItems: 'center', padding: '10px 0', borderBottom: `1px solid ${T.borderSoft}`, fontFamily: MONO, fontSize: 12.5 }}>
+              <span style={{ color: T.sub }}>{fmtDate(s.ts)}</span>
+              <span style={{ textAlign: 'right', color: bandFor(s.score).color, fontWeight: 700 }}>{s.score}</span>
+              <span style={{ textAlign: 'right', color: accColor(acc) }}>{acc}%</span>
+              <span style={{ textAlign: 'right', color: T.ink }}>{s.reached}/80</span>
+              <span style={{ textAlign: 'right', color: T.sub }}>{fmtClock(s.timeUsed)}</span>
+            </div>
+          );
+        })}
+      </div>
     </Panel>
   );
 }
 
 function InfoPanel() {
   const Row = ({ k, v }) => (
-    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: 12, padding: '7px 0', borderTop: `1px solid ${T.line}` }}>
-      <span style={{ fontFamily: MONO, fontSize: 12, color: T.amber, letterSpacing: '0.04em' }}>{k}</span>
+    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: 12, padding: '8px 0', borderTop: `1px solid ${T.border}` }}>
+      <span style={{ fontFamily: SANS, fontSize: 12, fontWeight: 600, color: T.amber, letterSpacing: '0.02em' }}>{k}</span>
       <span style={{ fontSize: 13, color: T.ink, lineHeight: 1.5 }}>{v}</span>
     </div>
   );
   return (
-    <Panel style={{ padding: '16px 18px', marginBottom: 22 }}>
+    <Panel style={{ padding: '18px 20px' }}>
       <Eyebrow>How this is scored</Eyebrow>
-      <div style={{ marginTop: 8 }}>
+      <div style={{ marginTop: 10 }}>
         <Row k="Format" v="80 multiple-choice questions, 8:00 total. Sequential — answering advances you; you can't skip or return." />
         <Row k="Scoring" v={<>+1 correct, &minus;1 wrong, 0 for questions you don&apos;t reach. This is the dominant reported rule; some sources report &minus;2 per wrong — that&apos;s disputed, so don&apos;t guess blindly.</>} />
         <Row k="Tiers" v={<><b style={{ color: T.red }}>&lt;55</b> below cutoff · <b style={{ color: T.amber }}>55&ndash;69</b> pass · <b style={{ color: T.cyan }}>70&ndash;76</b> competitive · <b style={{ color: T.green }}>77&ndash;80</b> top.</>} />
@@ -434,7 +760,6 @@ function TestView({ q, idx, remaining, onAnswer }) {
   const clockColor = low ? T.red : T.amber;
   const pct = Math.max(0, (remaining / DURATION) * 100);
 
-  // keyboard 1-4 to answer
   useEffect(() => {
     const h = (e) => { const n = parseInt(e.key, 10); if (n >= 1 && n <= 4) onAnswer(n - 1); };
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
@@ -442,8 +767,7 @@ function TestView({ q, idx, remaining, onAnswer }) {
 
   if (!q) return null;
   return (
-    <div style={{ minHeight: 460 }}>
-      {/* status bar */}
+    <div style={{ minHeight: 460, maxWidth: 720, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <div className={critical ? 'pulse' : ''} style={{ fontFamily: MONO, fontSize: 'clamp(2rem,8vw,2.8rem)', fontWeight: 700, color: clockColor, lineHeight: 1, letterSpacing: '0.02em' }}>
           {fmtClock(secs)}
@@ -456,20 +780,17 @@ function TestView({ q, idx, remaining, onAnswer }) {
         </div>
       </div>
 
-      {/* depletion bar */}
-      <div style={{ height: 4, background: T.line, borderRadius: 4, overflow: 'hidden', marginBottom: 'clamp(28px,7vh,64px)' }}>
+      <div style={{ height: 4, background: T.border, borderRadius: 4, overflow: 'hidden', marginBottom: 'clamp(30px,8vh,68px)' }}>
         <div style={{ width: `${pct}%`, height: '100%', background: clockColor, transition: 'width .2s linear' }} />
       </div>
 
-      {/* question */}
-      <div style={{ textAlign: 'center', marginBottom: 'clamp(28px,7vh,56px)' }}>
+      <div style={{ textAlign: 'center', marginBottom: 'clamp(30px,8vh,60px)' }}>
         <div style={{ fontFamily: MONO, fontWeight: 700, fontSize: 'clamp(2.6rem,11vw,5rem)', letterSpacing: '-0.01em', lineHeight: 1.05, color: T.ink }}>
           {q.q}
         </div>
       </div>
 
-      {/* options */}
-      <div className="opts" style={{ maxWidth: 560, margin: '0 auto' }}>
+      <div className="opts">
         {q.options.map((o, i) => (
           <button key={i} className="opt" onClick={() => onAnswer(i)}>
             <span style={{ color: T.faint, fontSize: 12, marginRight: 8 }}>{i + 1}</span>
@@ -499,52 +820,53 @@ function Results({ r, onRetake, onHome }) {
     <div>
       <header style={{ marginBottom: 18 }}>
         <Eyebrow color={T.amber}>Result</Eyebrow>
-        <h1 style={{ fontFamily: MONO, fontSize: 'clamp(1.8rem,6vw,2.4rem)', margin: '4px 0 0', fontWeight: 700 }}>80-in-8 complete</h1>
+        <h1 style={{ fontFamily: DISPLAY, fontSize: 'clamp(1.9rem,6vw,2.6rem)', margin: '6px 0 0', fontWeight: 700, letterSpacing: '-0.02em' }}>80-in-8 complete</h1>
       </header>
 
-      {/* score + band */}
-      <Panel style={{ padding: '24px 22px', marginBottom: 16 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap' }}>
+      <Panel style={{ padding: '26px 24px', marginBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 26, flexWrap: 'wrap' }}>
           <div>
             <Eyebrow>Net score</Eyebrow>
             <div style={{ fontFamily: MONO, fontSize: 'clamp(3.4rem,16vw,5.2rem)', fontWeight: 700, color: b.color, lineHeight: 1 }}>{r.score}</div>
-            <div style={{ fontFamily: MONO, fontSize: 12, color: T.faint, marginTop: 2 }}>{r.correct} right &minus; {r.wrong} wrong &middot; max 80</div>
+            <div style={{ fontFamily: MONO, fontSize: 12, color: T.faint, marginTop: 2 }}>{r.correct} right &minus; {r.wrong} wrong · max 80</div>
           </div>
           <div style={{ flex: 1, minWidth: 200 }}>
-            <span style={{ display: 'inline-block', background: b.color, color: '#06121a', fontFamily: MONO, fontWeight: 700, fontSize: 13, padding: '5px 12px', borderRadius: 999, letterSpacing: '0.03em' }}>
+            <span style={{ display: 'inline-block', background: b.color, color: '#06121a', fontFamily: MONO, fontWeight: 700, fontSize: 13, padding: '5px 12px', borderRadius: 999, letterSpacing: '0.02em' }}>
               {b.label} · {b.range}
             </span>
             <p style={{ color: T.ink, fontSize: 14, lineHeight: 1.55, margin: '12px 0 0' }}>{b.note}</p>
           </div>
         </div>
-        <p style={{ color: T.faint, fontFamily: MONO, fontSize: 11, lineHeight: 1.5, marginTop: 16, borderTop: `1px solid ${T.line}`, paddingTop: 12 }}>
+        <p style={{ color: T.faint, fontFamily: MONO, fontSize: 11, lineHeight: 1.5, marginTop: 16, borderTop: `1px solid ${T.border}`, paddingTop: 12 }}>
           Tiers are community-reported, not official, and not a percentile — Optiver has never published score distributions.
         </p>
       </Panel>
 
-      {/* stat tiles */}
-      <div className="tiles" style={{ marginBottom: 16 }}>
+      <div className="tiles" style={{ marginBottom: 12 }}>
         <Tile label="Correct" value={r.correct} color={T.cyan} />
         <Tile label="Wrong" value={r.wrong} color={T.red} />
-        <Tile label="Not reached" value={r.unreached} color={T.muted} />
+        <Tile label="Not reached" value={r.unreached} color={T.sub} />
         <Tile label="Accuracy" value={`${r.accuracy}%`} color={accColor(r.accuracy)} />
+        <Tile label="Reached" value={`${r.reached}/80`} color={reachedColor(r.reached)} />
+        <Tile label="Pace" value={r.avgSpeed === null ? '—' : `${r.avgSpeed.toFixed(1)}s`} sub="per question" color={r.avgSpeed === null ? T.faint : speedColor(r.avgSpeed)} />
       </div>
-      <p style={{ color: T.muted, fontFamily: MONO, fontSize: 12, margin: '-4px 0 18px' }}>
-        Reached {r.reached}/{TOTAL} · finished in {fmtClock(r.timeUsed)} · accuracy is correct &divide; reached.
+      <p style={{ color: T.sub, fontFamily: MONO, fontSize: 12, margin: '0 0 18px' }}>
+        Finished in {fmtClock(r.timeUsed)} · accuracy is correct &divide; reached.
       </p>
 
-      {/* per-type breakdown */}
-      <Panel style={{ padding: 18, marginBottom: 16 }}>
+      <Panel style={{ padding: 20, marginBottom: 16 }}>
         <Eyebrow>This session, by type</Eyebrow>
-        <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 11 }}>
           {ORDER.map((t) => {
             const a = r.byType[t]; const pct = a.att ? Math.round((a.correct / a.att) * 100) : null;
+            const sp = a.att && a.ms ? a.ms / a.att / 1000 : null;
             return (
-              <div key={t} style={{ display: 'grid', gridTemplateColumns: '128px 1fr 84px', alignItems: 'center', gap: 12 }}>
-                <span style={{ fontSize: 12.5, color: T.muted }}>{LABELS[t]}</span>
-                <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, height: 12, overflow: 'hidden' }}>
+              <div key={t} style={{ display: 'grid', gridTemplateColumns: '132px 1fr 56px 84px', alignItems: 'center', gap: 12 }}>
+                <span style={{ fontSize: 13, color: T.sub }}>{LABELS[t]}</span>
+                <div style={{ background: T.surface2, border: `1px solid ${T.border}`, borderRadius: 6, height: 11, overflow: 'hidden' }}>
                   {pct !== null && <div style={{ width: `${pct}%`, height: '100%', background: accColor(pct) }} />}
                 </div>
+                <span style={{ fontFamily: MONO, fontSize: 12, color: sp === null ? T.faint : speedColor(sp), textAlign: 'right' }}>{sp === null ? '—' : `${sp.toFixed(1)}s`}</span>
                 <span style={{ fontFamily: MONO, fontSize: 12, color: pct === null ? T.faint : accColor(pct), textAlign: 'right' }}>
                   {pct === null ? 'not reached' : `${pct}% · ${a.correct}/${a.att}`}
                 </span>
@@ -555,18 +877,52 @@ function Results({ r, onRetake, onHome }) {
       </Panel>
 
       {drill.length > 0 && (
-        <Panel style={{ padding: '14px 18px', marginBottom: 18, borderColor: T.amber }}>
+        <Panel style={{ padding: '15px 19px', marginBottom: 18, borderLeft: `3px solid ${T.amber}` }}>
           <Eyebrow color={T.amber}>Drill next</Eyebrow>
           <p style={{ color: T.ink, fontSize: 14, margin: '8px 0 0', lineHeight: 1.5 }}>
-            Weakest this session: <b>{drill.map((d) => LABELS[d.t]).join('</b> and <b>')}</b>. Decimal division and two-digit multiplication are the usual culprits — target those before your next full run.
+            Weakest this session: <b>{drill.map((d) => LABELS[d.t]).join(' and ')}</b>. Decimal division and two-digit multiplication are the usual culprits — target those before your next full run.
           </p>
         </Panel>
       )}
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-        <button className="btn" onClick={onRetake} style={{ background: T.cyan, color: '#04231f', fontFamily: MONO, fontWeight: 700, fontSize: 15, padding: '13px 24px' }}>Retake →</button>
-        <button className="btn" onClick={onHome} style={{ background: T.panel, border: `1px solid ${T.line}`, color: T.ink, fontFamily: MONO, fontSize: 15, padding: '13px 24px' }}>Dashboard</button>
+        <button className="pill btn" onClick={onRetake} style={{ fontSize: 15, padding: '13px 24px' }}>Retake →</button>
+        <button className="btn" onClick={onHome} style={{ background: T.surface, border: `1px solid ${T.border}`, color: T.ink, fontFamily: SANS, fontWeight: 600, fontSize: 15, padding: '13px 24px' }}>Dashboard</button>
       </div>
     </div>
   );
 }
+
+/* ----------------------------- styles ------------------------------------- */
+const styles = `
+.o8 *{box-sizing:border-box}
+.o8 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+.o8 input{outline:none}
+.o8 input:focus{border-color:${T.amber}}
+.o8 .card{background:${T.surface};border:1px solid ${T.border};border-radius:16px;box-shadow:0 12px 34px -16px rgba(0,0,0,.75)}
+.o8 .nav{position:sticky;top:0;z-index:30;display:flex;align-items:center;justify-content:space-between;padding:14px 22px;background:rgba(8,9,13,.72);backdrop-filter:saturate(140%) blur(12px);-webkit-backdrop-filter:saturate(140%) blur(12px);border-bottom:1px solid ${T.border}}
+.o8 .pill{background:${T.ink};color:#0a0b0f;border-radius:11px;font-family:${SANS};font-weight:600;padding:11px 20px}
+.o8 .pill:hover{filter:brightness(.92)}
+.o8 .ghost{color:${T.sub};padding:10px 12px;border-radius:10px;font-family:${SANS};transition:color .15s,background .15s}
+.o8 .ghost:hover{color:${T.ink};background:rgba(255,255,255,.05)}
+.o8 .opt{background:${T.surface};border:1px solid ${T.border};border-radius:14px;padding:22px 16px;font-family:${MONO};color:${T.ink};transition:border-color .12s,background .12s,transform .05s;text-align:center}
+.o8 .opt:hover:not(:disabled){border-color:${T.amber};background:#14161d}
+.o8 .opt:active{transform:translateY(1px)}
+.o8 .opt:focus-visible,.o8 .pill:focus-visible,.o8 .ghost:focus-visible,.o8 .btn:focus-visible{outline:2px solid ${T.amber};outline-offset:2px}
+.o8 .btn{transition:filter .15s,transform .06s}
+.o8 .btn:hover{filter:brightness(1.05)}
+.o8 .btn:active{transform:translateY(1px)}
+.o8 .hero-grid{display:grid;grid-template-columns:1fr;gap:36px;align-items:center}
+.o8 .opts{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.o8 .tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.o8 .split{display:grid;grid-template-columns:1.45fr 1fr;gap:16px;align-items:start}
+@media(min-width:860px){.o8 .hero-grid{grid-template-columns:1.08fr .92fr}}
+@media(max-width:900px){.o8 .tiles{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:820px){.o8 .split{grid-template-columns:1fr}}
+@media(max-width:560px){.o8 .opts{grid-template-columns:1fr}.o8 .tiles{grid-template-columns:repeat(2,1fr)}}
+.o8 .pulse{animation:o8pulse 1s ease-in-out infinite}
+@keyframes o8pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.o8 .fadein{animation:o8fade .55s ease both}
+@keyframes o8fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.o8 *{animation:none!important;transition:none!important}}
+`;
